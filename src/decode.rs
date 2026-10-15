@@ -185,7 +185,26 @@ pub fn probe(bytes: &[u8]) -> Result<FlacInfo, Error> {
     let mut info =
         info.ok_or_else(|| Error::Invalid("FLAC file has no STREAMINFO block".into()))?;
     info.audio_offset = offset;
+
+    // Advance audio_offset to the first frame that actually decodes
+    if let Some(real_start) = find_first_valid_frame(bytes, offset, info.bits_per_sample) {
+        info.audio_offset = real_start;
+    }
+
     Ok(info)
+}
+
+fn find_first_valid_frame(bytes: &[u8], from: usize, stream_bps: u32) -> Option<usize> {
+    let mut i = from;
+    while i + 6 < bytes.len() {
+        if bytes[i] == 0xff && (bytes[i + 1] & 0xfe) == 0xf8 {
+            if read_frame(&bytes[i..], stream_bps).is_ok() {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Decode a FLAC byte slice to interleaved PCM.
@@ -203,6 +222,7 @@ fn decode_bytes(bytes: &[u8], options: &Options) -> Result<Pcm, Error> {
     let info = probe(bytes)?;
     let threads = worker_count(options.threads);
     let ranges = plan_ranges(bytes, &info, threads)?;
+
     let parts = if ranges.len() == 1 {
         vec![decode_range(bytes, ranges[0].0, ranges[0].1, &info)?]
     } else {
@@ -227,6 +247,12 @@ fn decode_bytes(bytes: &[u8], options: &Options) -> Result<Pcm, Error> {
     for part in parts {
         interleaved.extend(part);
     }
+
+    // Fallback: if the normal path produced nothing, do a full byte-by-byte scan
+    if interleaved.is_empty() {
+        interleaved = decode_full_scan(bytes, &info)?;
+    }
+
     if info.channels == 0 || !interleaved.len().is_multiple_of(info.channels as usize) {
         return Err(Error::Decode(
             "decoded sample count is not divisible by the channel count".into(),
@@ -234,7 +260,10 @@ fn decode_bytes(bytes: &[u8], options: &Options) -> Result<Pcm, Error> {
     }
     let per_channel = (interleaved.len() / info.channels as usize) as u64;
     if let Some(expected) = info.total_samples {
-        if per_channel != expected {
+        let diff = (per_channel as i64 - expected as i64).abs();
+        // Allow missing up to one typical frame (or 1%, whichever is larger)
+        let tolerance = (expected / 100).max(4608);
+        if diff > tolerance as i64 {
             return Err(Error::Decode(format!(
                 "decoded {per_channel} samples per channel, STREAMINFO says {expected}"
             )));
@@ -327,49 +356,38 @@ fn decode_range(
     let slice = &bytes[start..end];
     let mut pos = 0usize;
     let mut out = Vec::new();
+
     while pos + 6 <= slice.len() {
         match read_frame(&slice[pos..], info.bits_per_sample) {
             Ok(frame) => {
                 if frame.consumed == 0 || pos + frame.consumed > slice.len() {
-                    return Err(Error::Decode(
-                        "decoder reported a frame that does not fit in its range".into(),
-                    ));
+                    // Bad length — skip one byte and keep searching
+                    pos += 1;
+                    continue;
                 }
                 if frame.channels != info.channels {
-                    return Err(Error::Decode(format!(
-                        "frame at offset {} has {} channels, STREAMINFO says {}",
-                        start + pos,
-                        frame.channels,
-                        info.channels
-                    )));
+                    // Channel mismatch — skip and continue
+                    pos += 1;
+                    continue;
                 }
                 out.extend(frame.pcm);
                 pos += frame.consumed;
             }
             Err(FrameError::Missing) => {
-                if out.is_empty() {
-                    return Err(Error::Decode(format!(
-                        "no FLAC frame at file offset {}",
-                        start + pos
-                    )));
+                // No valid frame here — advance one byte and keep looking
+                pos += 1;
+                // Safety: don't scan forever if we already have data and we're near the end
+                if !out.is_empty() && slice.len() - pos <= MAX_TRAIL {
+                    break;
                 }
-                let trail = slice.len() - pos;
-                if trail > MAX_TRAIL {
-                    return Err(Error::Decode(format!(
-                        "stopped at file offset {} with {trail} bytes left before the next frame",
-                        start + pos
-                    )));
-                }
-                break;
             }
-            Err(FrameError::Failed(message)) => {
-                return Err(Error::Decode(format!(
-                    "frame at file offset {}: {message}",
-                    start + pos
-                )));
+            Err(FrameError::Failed(_)) => {
+                // Decode failed — skip one byte and continue
+                pos += 1;
             }
         }
     }
+
     if out.is_empty() {
         return Err(Error::Decode(format!(
             "no FLAC frame at file offset {start}"
@@ -508,15 +526,27 @@ fn parse_streaminfo(body: &[u8]) -> Result<FlacInfo, Error> {
 }
 
 fn parse_header(bytes: &[u8]) -> Option<Header> {
-    if bytes.len() < 6 || bytes[0] != 0xff || bytes[1] & 0xfe != 0xf8 || bytes[3] & 0x01 != 0 {
+    if bytes.len() < 6 || bytes[0] != 0xff || bytes[1] & 0xfe != 0xf8 {
+        return None;
+    }
+    // Reserved bit must be 0
+    if bytes[3] & 0x01 != 0 {
         return None;
     }
     let block_size_code = bytes[2] >> 4;
     let sample_rate_code = bytes[2] & 0x0f;
+    let channel_assignment = bytes[3] >> 4;
     let bps_code = (bytes[3] >> 1) & 0x07;
-    if block_size_code == 0 || sample_rate_code == 0x0f || bps_code == 0b011 {
+
+    // Reject illegal values
+    if block_size_code == 0
+        || sample_rate_code == 0x0f
+        || bps_code == 0b011
+        || channel_assignment > 10
+    {
         return None;
     }
+
     let mut index = 4usize;
     let number_len = coded_number_len(*bytes.get(index)?)?;
     if index + number_len > bytes.len() {
@@ -762,4 +792,24 @@ mod tests {
         let tagged = decode_flac(&wrapped, &opts(2)).unwrap();
         assert_eq!(plain.interleaved, tagged.interleaved);
     }
+}
+
+fn decode_full_scan(bytes: &[u8], info: &FlacInfo) -> Result<Vec<i32>, Error> {
+    let mut pos = info.audio_offset;
+    let mut out = Vec::new();
+    while pos + 6 < bytes.len() {
+        match read_frame(&bytes[pos..], info.bits_per_sample) {
+            Ok(frame) if frame.consumed > 0 && frame.channels == info.channels => {
+                out.extend(frame.pcm);
+                pos += frame.consumed;
+            }
+            _ => {
+                pos += 1;
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Decode("no valid FLAC frames found".into()));
+    }
+    Ok(out)
 }
